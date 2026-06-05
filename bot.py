@@ -1,202 +1,216 @@
-import telebot
 import ccxt
 import pandas as pd
-from datetime import datetime, timedelta
-import time
+from datetime import datetime, timedelta, time
+import asyncio
+import pytz
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 
 # ================== CẤU HÌNH ==================
-TOKEN = "8728655635:AAFCfai4nE3323W2knPb6lXAsPuyaf2EgcU"
+TELEGRAM_TOKEN = "8728655635:AAFCfai4nE3323W2knPb6lXAsPuyaf2EgcU"
 CHAT_ID = 1080023051
 
-bot = telebot.TeleBot(TOKEN)
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
+
+COOLDOWN_MINUTES = 90
+USE_LONDON_ONLY = False   # False = 24/7
 
 exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
 })
 
-TIMEFRAME = '30m'
-
-# ================== COOLDOWN ==================
-cooldown = {}
-
-def is_in_cooldown(symbol):
-    if symbol in cooldown:
-        if datetime.now() - cooldown[symbol] < timedelta(hours=1):
-            return True
-    return False
-
-def update_cooldown(symbol):
-    cooldown[symbol] = datetime.now()
-
-# ================== TOP 100 VOLUME ==================
-def get_top100_volume():
+# ================== HÀM HỖ TRỢ ==================
+def get_top_volume_symbols(limit=100):   # ← Đổi thành 100
     try:
+        print(f"🔄 Đang lấy Top {limit} coin volume cao nhất...")
         tickers = exchange.fetch_tickers()
-        futures = []
-        for sym, data in tickers.items():
-            if sym.endswith('USDT') and data.get('quoteVolume'):
-                futures.append({'symbol': sym, 'volume': data['quoteVolume']})
+        futures = [
+            {'symbol': s, 'volume': d.get('quoteVolume', 0)}
+            for s, d in tickers.items()
+            if s.endswith('USDT') and d.get('quoteVolume', 0) > 50_000_000
+        ]
         futures.sort(key=lambda x: x['volume'], reverse=True)
-        return [item['symbol'] for item in futures[:100]]
-    except:
+        top_symbols = [item['symbol'] for item in futures[:limit]]
+        print(f"✅ Đã lấy Top {len(top_symbols)} coin (volume > 50M)")
+        return top_symbols
+    except Exception as e:
+        print(f"Lỗi lấy top volume: {e}")
         return ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT']
 
-SYMBOLS = get_top100_volume()
-
-# ================== HÀM PHÂN TÍCH ==================
-def get_data(symbol, tf='30m', limit=400):
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-    except:
-        return None
 
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def detect_signal(df, symbol):
-    if df is None or len(df) < 100:
-        return None
-    
-    close = df['close']
-    volume = df['volume']
-    
-    ema5  = ema(close, 5)
-    ema9  = ema(close, 9)
-    ema13 = ema(close, 13)
-    ema21 = ema(close, 21)
-    ema200 = ema(close, 200)
-    
-    last = df.iloc[-1]
-    p1 = df.iloc[-2]
-    p2 = df.iloc[-3]
-    p3 = df.iloc[-4]
-    
-    bias = "BUY" if last['close'] > ema200.iloc[-1] else "SELL"
-    
-    if bias == "BUY":
-        if not (ema5.iloc[-1] > ema9.iloc[-1] > ema13.iloc[-1] > ema21.iloc[-1]):
-            return None
-    else:
-        if not (ema5.iloc[-1] < ema9.iloc[-1] < ema13.iloc[-1] < ema21.iloc[-1]):
-            return None
-    
-    vol_increase = volume.iloc[-1] > volume.iloc[-5:].mean() * 1.3
-    
-    if bias == "BUY" and p1['low'] > p3['high']:
-        midpoint = (p3['high'] + p1['low']) / 2
-        body = abs(p2['open'] - p2['close'])
-        candle_range = p2['high'] - p2['low'] + 0.000001
-        is_doji = body / candle_range <= 0.38
-        wick_test = p2['low'] <= midpoint <= p2['high']
-        confirm = last['close'] > p2['high']
-        
-        if is_doji and wick_test and confirm and vol_increase:
-            sl = p2['low'] - 0.0008 if any(x in symbol for x in ['BTC','ETH']) else p2['low'] - 0.0004
-            entry = last['close']
-            tp = entry + (entry - sl) * 20
-            return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "symbol": symbol}
-    
-    elif bias == "SELL" and p1['high'] < p3['low']:
-        midpoint = (p3['low'] + p1['high']) / 2
-        body = abs(p2['open'] - p2['close'])
-        candle_range = p2['high'] - p2['low'] + 0.000001
-        is_doji = body / candle_range <= 0.38
-        wick_test = p2['low'] <= midpoint <= p2['high']
-        confirm = last['close'] < p2['low']
-        
-        if is_doji and wick_test and confirm and vol_increase:
-            sl = p2['high'] + 0.0008 if any(x in symbol for x in ['BTC','ETH']) else p2['high'] + 0.0004
-            entry = last['close']
-            tp = entry - (sl - entry) * 20
-            return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "symbol": symbol}
-    
-    return None
 
-def gui_tin_hieu(signal):
-    now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
-    emoji = "🟢 BUY" if signal['side'] == "BUY" else "🔴 SELL"
-    
-    msg = f"""
-🚨 **TYLER TRIDENT SIGNAL** 🚨
+def is_london_killzone(dt):
+    ny_tz = pytz.timezone('America/New_York')
+    ny_time = dt.astimezone(ny_tz)
+    return time(3, 0) <= ny_time.time() <= time(6, 30)
 
-**Coin:** `{signal['symbol']}`
-**Loại:** {emoji}
-**Entry:** `{signal['entry']:.5f}`
 
-**SL:** `{signal['sl']:.5f}`
-**TP:** `{signal['tp']:.5f}` **(1:20)**
-
-🕒 {now}
-    """
-    bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
-    print(f"✅ Signal: {signal['symbol']} {signal['side']}")
-
-# ================== LỆNH TELEGRAM ==================
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.reply_to(message, """
-🤖 **Tyler Trident Bot v2**
-
-`/status` - Kiểm tra tình trạng bot
-`/help`   - Hiển thị lệnh
-
-Bot đang quét **Top 100 coin** volume cao nhất trên Binance Futures (30m).
-    """, parse_mode='Markdown')
-
-@bot.message_handler(commands=['status'])
-def send_status(message):
-    now = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
-    total_coins = len(SYMBOLS)
-    
-    msg = f"""
-📊 **BOT STATUS**
-
-**Trạng thái:** ✅ Hoạt động
-**Mode:** 24/7
-**Timeframe:** 30m
-**Số coin đang quét:** {total_coins} coin
-**Cooldown:** 1 giờ mỗi coin
-**Thời gian:** {now}
-
-✅ Bot đang chạy tốt!
-    """
-    bot.reply_to(message, msg, parse_mode='Markdown')
-
-# ================== CHẠY BOT ==================
-print("🤖 Bot Tyler Trident Style v2 đang chạy...")
-
-# Polling để nhận lệnh Telegram
-import threading
-
-def run_bot():
-    print("✅ Bot Telegram đã sẵn sàng nhận lệnh (/status, /start)...")
-    bot.polling(none_stop=True)
-
-# Chạy polling trong thread riêng
-threading.Thread(target=run_bot, daemon=True).start()
-
-# Vòng quét signal
-while True:
+def check_higher_tf_bias(symbol, bias):
     try:
-        signal_count = 0
-        for sym in SYMBOLS:
-            if is_in_cooldown(sym):
-                continue
-                
-            df = get_data(sym)
-            signal = detect_signal(df, sym)
-            if signal:
-                gui_tin_hieu(signal)
-                update_cooldown(sym)
-                signal_count += 1
-                break
-                
-        print(f"✅ Vòng quét hoàn thành | Signal: {signal_count} | {datetime.now().strftime('%H:%M:%S')}")
-        time.sleep(40)
+        ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=80)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        for p in [5, 9, 13, 21, 200]:
+            df[f'ema{p}'] = ema(df['close'], p)
+        curr = df.iloc[-1]
+        if bias == "BUY":
+            return curr['ema5'] > curr['ema9'] > curr['ema13'] > curr['ema21'] > curr['ema200']
+        return curr['ema5'] < curr['ema9'] < curr['ema13'] < curr['ema21'] < curr['ema200']
+    except:
+        return False
+
+
+async def send_signal(message: str):
+    try:
+        await bot.send_message(CHAT_ID, message, parse_mode='HTML')
+        print(f"✅ Signal gửi: {datetime.now().strftime('%H:%M:%S')}")
     except Exception as e:
-        print(f"Lỗi: {e}")
-        time.sleep(10)
+        print(f"Lỗi Telegram: {e}")
+
+
+# ================== COMMANDS ==================
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    mode = "🟢 London Killzone" if USE_LONDON_ONLY else "🔴 24/7 Full Scan"
+    await message.reply(f"🤖 <b>Tyler Trident Bot</b> đã online!\nMode: <b>{mode}</b>\nQuét: Top 100 coin", parse_mode='HTML')
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    mode = "🟢 London Killzone" if USE_LONDON_ONLY else "🔴 24/7 Full Scan"
+    await message.reply(
+        f"📊 <b>Bot Status</b>\n"
+        f"Mode: <b>{mode}</b>\n"
+        f"Quét: Top 100 volume\n"
+        f"Cooldown: {COOLDOWN_MINUTES} phút/signal\n"
+        f"Time: {datetime.now(pytz.UTC).strftime('%H:%M:%S UTC')}",
+        parse_mode='HTML'
+    )
+
+
+@dp.message(Command("london"))
+async def cmd_toggle_london(message: types.Message):
+    global USE_LONDON_ONLY
+    USE_LONDON_ONLY = not USE_LONDON_ONLY
+    mode = "🟢 London Killzone" if USE_LONDON_ONLY else "🔴 24/7 Full Scan"
+    await message.reply(f"✅ Đã chuyển mode thành: <b>{mode}</b>", parse_mode='HTML')
+    print(f"🔄 Mode thay đổi: {mode}")
+
+
+# ====================== LIVE SCANNER ======================
+async def live_scanner():
+    print("🚀 Tyler Trident Bot (Top 100 Volume) đang chạy...")
+    cooldown = {}
+
+    while True:
+        now = datetime.now(pytz.UTC)
+        
+        if USE_LONDON_ONLY and not is_london_killzone(now):
+            await asyncio.sleep(30)
+            continue
+
+        symbols = get_top_volume_symbols(100)   # ← Top 100
+        signal_count = 0
+        mode_str = "London" if USE_LONDON_ONLY else "24/7"
+
+        print(f"[{now.strftime('%H:%M:%S UTC')}] Quét {mode_str} | Top 100 coins")
+
+        for symbol in symbols:
+            try:
+                if symbol in cooldown and (now - cooldown[symbol]) < timedelta(minutes=COOLDOWN_MINUTES):
+                    continue
+
+                ohlcv = exchange.fetch_ohlcv(symbol, '30m', limit=150)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df.set_index('timestamp', inplace=True)
+
+                if len(df) < 100:
+                    continue
+
+                for p in [5, 9, 13, 21, 200]:
+                    df[f'ema{p}'] = ema(df['close'], p)
+
+                df['atr'] = (df['high'] - df['low']).rolling(14).mean().ffill()
+                df['vol_ma'] = df['volume'].rolling(8).mean().ffill()
+
+                curr = df.iloc[-1]
+                rej = df.iloc[-2]
+                left = df.iloc[-3]
+
+                bias = "BUY" if curr['close'] > curr['ema200'] else "SELL"
+
+                ema_ok = (
+                    (bias == "BUY" and curr['ema5'] > curr['ema9'] > curr['ema13'] > curr['ema21'] > curr['ema200']) or
+                    (bias == "SELL" and curr['ema5'] < curr['ema9'] < curr['ema13'] < curr['ema21'] < curr['ema200'])
+                )
+                if not ema_ok: continue
+
+                if curr['volume'] < curr['vol_ma'] * 1.35: continue
+                if not check_higher_tf_bias(symbol, bias): continue
+
+                signal = None
+
+                # BUY
+                if bias == "BUY" and left['low'] > rej['high']:
+                    fvg_mid = (left['low'] + rej['high']) / 2
+                    body_ratio = abs(rej['close'] - rej['open']) / (rej['high'] - rej['low'] + 1e-8)
+                    if (rej['low'] <= fvg_mid <= rej['high'] and body_ratio <= 0.45 and curr['close'] > rej['high']):
+                        entry = curr['close']
+                        sl = rej['low'] - curr['atr'] * 0.35
+                        risk = entry - sl
+                        if risk > curr['atr'] * 0.5:
+                            tp = entry + risk * 8
+                            signal = f"""🚀 <b>TYLER BUY SIGNAL</b> <i>({mode_str})</i>
+
+📍 <b>{symbol}</b>
+Entry: <code>{entry:.4f}</code>
+SL: <code>{sl:.4f}</code>
+TP: <code>{tp:.4f}</code> (1:8)
+FVG: <code>{fvg_mid:.4f}</code>"""
+
+                # SELL
+                elif bias == "SELL" and left['high'] < rej['low']:
+                    fvg_mid = (left['high'] + rej['low']) / 2
+                    body_ratio = abs(rej['close'] - rej['open']) / (rej['high'] - rej['low'] + 1e-8)
+                    if (rej['high'] >= fvg_mid >= rej['low'] and body_ratio <= 0.45 and curr['close'] < rej['low']):
+                        entry = curr['close']
+                        sl = rej['high'] + curr['atr'] * 0.35
+                        risk = sl - entry
+                        if risk > curr['atr'] * 0.5:
+                            tp = entry - risk * 8
+                            signal = f"""🔴 <b>TYLER SELL SIGNAL</b> <i>({mode_str})</i>
+
+📍 <b>{symbol}</b>
+Entry: <code>{entry:.4f}</code>
+SL: <code>{sl:.4f}</code>
+TP: <code>{tp:.4f}</code> (1:8)
+FVG: <code>{fvg_mid:.4f}</code>"""
+
+                if signal:
+                    await send_signal(signal)
+                    cooldown[symbol] = now
+                    signal_count += 1
+                    print(f"🚨 SIGNAL {bias} → {symbol}")
+                    await asyncio.sleep(8)   # Nghỉ ngắn để tránh spam
+
+            except Exception:
+                continue
+
+        print(f"   Hoàn thành vòng quét | Tìm thấy {signal_count} signal\n")
+        await asyncio.sleep(20)
+
+
+async def main():
+    print("🤖 Tyler Trident Bot (Top 100) Started!")
+    asyncio.create_task(live_scanner())
+    await dp.start_polling(bot, skip_updates=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
